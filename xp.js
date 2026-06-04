@@ -96,8 +96,8 @@ bot.onText(/^\/(rank|me)(?:@\w+)?$/i, async (msg)=>{
 bot.onText(/^\/bag(?:@\w+)?$/i, (msg)=>{
   const arr=Object.values(DB.users).filter(x=>x.xp>0).sort((a,b)=>b.xp-a.xp).slice(0,10);
   if(!arr.length) return bot.sendMessage(msg.chat.id,'no one\u2019s earned XP yet. start chatting 👀');
-  let s='🏆 *TOP BAGS*\n'; arr.forEach((x,i)=>{ const r=rankFor(x.xp,RANKS); s+=`${i+1}. ${r.emoji} ${x.name||'anon'} — ${x.xp} XP\n`; });
-  bot.sendMessage(msg.chat.id,s,{parse_mode:'Markdown'});
+  let s='🏆 TOP BAGS\n'; arr.forEach((x,i)=>{ const r=rankFor(x.xp,RANKS); s+=`${i+1}. ${r.emoji} ${x.name||'anon'} — ${x.xp} XP\n`; });
+  bot.sendMessage(msg.chat.id,s);
 });
 
 bot.onText(/^\/wallet(?:@\w+)?\s+(\S+)/i, (msg,m)=>{
