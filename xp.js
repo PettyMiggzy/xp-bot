@@ -36,6 +36,8 @@ const CLAIM_CONTRACT = process.env.CLAIM_CONTRACT || '';        // ChronicXPClai
 const SIGNER_PK      = process.env.SIGNER_PRIVATE_KEY || '';    // bot's signer key (matches contract's signer())
 const API_PORT       = Number(process.env.API_PORT || '8645'); // claim-data HTTP endpoint port
 const CHAIN_ID       = 143;
+const CLAIM_COOLDOWN_DAYS = Number(process.env.CLAIM_COOLDOWN_DAYS || '7'); // weekly harvest
+const CLAIM_COOLDOWN_MS2  = CLAIM_COOLDOWN_DAYS * 86400000;
 
 if (!TG_TOKEN) { console.error('Missing TG_BOT_TOKEN'); process.exit(1); }
 
@@ -43,12 +45,13 @@ const bot = new TelegramBot(TG_TOKEN, { polling: true });
 const RANKS = RANKSETS[PROJECT] || RANKSETS.default;
 
 // chain (only needed for payouts/holder check)
-let provider=null, payoutWallet=null, token=null, claimSigner=null;
+let provider=null, payoutWallet=null, token=null, claimSigner=null, claimReader=null;
 try {
   provider = new JsonRpcProvider(RPC, 143);
   if (PAYOUT_PK) payoutWallet = new Wallet(PAYOUT_PK, provider);
   if (TOKEN_ADDR) token = new Contract(TOKEN_ADDR, ['function balanceOf(address) view returns (uint256)'], provider);
   if (SIGNER_PK) claimSigner = new Wallet(SIGNER_PK);  // used only to SIGN claim authorizations (no funds)
+  if (CLAIM_CONTRACT) claimReader = new Contract(CLAIM_CONTRACT, ['function claimedChronic(address) view returns (uint256)','function claimedMon(address) view returns (uint256)'], provider);
 } catch (e) { console.error('chain init:', e.message); }
 
 // ============ PERSISTENCE ============
@@ -181,6 +184,27 @@ if (claimSigner && CLAIM_CONTRACT) {
       if (!usr) { res.writeHead(200); return res.end(JSON.stringify({ found:false, message:'wallet not linked to any XP account — use /wallet in the group' })); }
 
       await refreshHolds(usr); // refresh 1M-holder status for MON gating
+
+      // detect an ACTUAL on-chain claim: if contract's claimed total rose since we last saw it,
+      // they harvested -> stamp the time and start the 7-day cooldown from the real claim.
+      const now = Date.now();
+      try{
+        if(claimReader){
+          const onchain = await claimReader.claimedChronic(wallet);
+          const prev = BigInt(usr.lastSeenClaimedChronic || '0');
+          if(onchain > prev){ usr.lastHarvest = now; usr.lastSeenClaimedChronic = onchain.toString(); save(); }
+        }
+      }catch(e){ /* read fail -> don't block */ }
+
+      // weekly-harvest cooldown based on the real last claim
+      const wait = CLAIM_COOLDOWN_MS2 - (now - (usr.lastHarvest||0));
+      if (usr.lastHarvest && wait > 0) {
+        const days = Math.ceil(wait/86400000);
+        res.writeHead(200);
+        return res.end(JSON.stringify({ found:true, cooldown:true,
+          message:'already harvested this week — next harvest in ~'+days+' day(s) 🌿',
+          xp: usr.xp }));
+      }
 
       const r = rankFor(usr.xp, RANKS);
       const nx = nextRank(usr.xp, RANKS);
