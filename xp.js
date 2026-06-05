@@ -100,6 +100,11 @@ bot.onText(/^\/bag(?:@\w+)?$/i, (msg)=>{
   bot.sendMessage(msg.chat.id,s);
 });
 
+bot.onText(/^\/wallet(?:@\w+)?\s*$/i, (msg)=>{
+  const usr=u(msg.from.id);
+  if(usr.wallet) bot.sendMessage(msg.chat.id,`your linked wallet: ${usr.wallet.slice(0,6)}…${usr.wallet.slice(-4)}\nto change it: /wallet 0xYourNewAddress`,{reply_to_message_id:msg.message_id});
+  else bot.sendMessage(msg.chat.id,`link your wallet like this:\n/wallet 0xYourAddress\n\n(needed to claim your ${TOKEN_SYM} rewards)`,{reply_to_message_id:msg.message_id});
+});
 bot.onText(/^\/wallet(?:@\w+)?\s+(\S+)/i, (msg,m)=>{
   const addr=m[1].trim();
   if(!isAddress(addr)) return bot.sendMessage(msg.chat.id,'that\u2019s not a valid 0x address ser',{reply_to_message_id:msg.message_id});
