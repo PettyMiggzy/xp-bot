@@ -1,7 +1,8 @@
 import 'dotenv/config';
 import fs from 'fs';
 import TelegramBot from 'node-telegram-bot-api';
-import { JsonRpcProvider, Wallet, Contract, parseEther, formatEther, parseUnits, isAddress } from 'ethers';
+import http from 'http';
+import { JsonRpcProvider, Wallet, Contract, parseEther, formatEther, parseUnits, isAddress, getBytes, solidityPackedKeccak256 } from 'ethers';
 import { RANKSETS, rankFor, nextRank } from './ranks.js';
 
 // ============ CONFIG (all from .env) ============
@@ -30,6 +31,11 @@ const XP_COOLDOWN_MS= Number(process.env.XP_COOLDOWN_SEC || '60') * 1000; // max
 const PAYOUTS_ENABLED = String(process.env.PAYOUTS_ENABLED || 'false').toLowerCase() === 'true';
 const PAYOUT_PK = process.env.PAYOUT_PRIVATE_KEY || '';
 const CLAIM_URL = process.env.CLAIM_URL || 'https://burnchronic.xyz/claim';
+// ---- claim contract wiring ----
+const CLAIM_CONTRACT = process.env.CLAIM_CONTRACT || '';        // ChronicXPClaim address
+const SIGNER_PK      = process.env.SIGNER_PRIVATE_KEY || '';    // bot's signer key (matches contract's signer())
+const API_PORT       = Number(process.env.API_PORT || '8645'); // claim-data HTTP endpoint port
+const CHAIN_ID       = 143;
 
 if (!TG_TOKEN) { console.error('Missing TG_BOT_TOKEN'); process.exit(1); }
 
@@ -37,11 +43,12 @@ const bot = new TelegramBot(TG_TOKEN, { polling: true });
 const RANKS = RANKSETS[PROJECT] || RANKSETS.default;
 
 // chain (only needed for payouts/holder check)
-let provider=null, payoutWallet=null, token=null;
+let provider=null, payoutWallet=null, token=null, claimSigner=null;
 try {
   provider = new JsonRpcProvider(RPC, 143);
   if (PAYOUT_PK) payoutWallet = new Wallet(PAYOUT_PK, provider);
   if (TOKEN_ADDR) token = new Contract(TOKEN_ADDR, ['function balanceOf(address) view returns (uint256)'], provider);
+  if (SIGNER_PK) claimSigner = new Wallet(SIGNER_PK);  // used only to SIGN claim authorizations (no funds)
 } catch (e) { console.error('chain init:', e.message); }
 
 // ============ PERSISTENCE ============
@@ -127,6 +134,76 @@ bot.onText(/^\/help(?:@\w+)?$/i, (msg)=>{
 `*${PROJECT.toUpperCase()} XP*\nchat (3+ words) to earn XP + ${TOKEN_SYM}. hold ${Number(HOLD_REQ).toLocaleString()} ${TOKEN_SYM} to also earn MON.\n\n/rank — your XP, rank & claimable\n/bag — leaderboard\n/wallet 0x… — link your wallet\n/claim — how to claim`,
   {parse_mode:'Markdown'});
 });
+
+
+// =====================================================================
+//                CLAIM SIGNING + HTTP ENDPOINT
+// =====================================================================
+// The claim page POSTs/GETs a wallet address; we look up the linked user,
+// compute cumulative owed totals, sign them (getBytes(inner) — raw 32 bytes,
+// EXACTLY matching the contract), and return {totalChronic,totalMon,signature}.
+
+function userByWallet(addr){
+  const lc = addr.toLowerCase();
+  for (const id in DB.users){ const u=DB.users[id]; if(u.wallet && u.wallet.toLowerCase()===lc) return u; }
+  return null;
+}
+
+// cumulative LIFETIME owed, in wei (what the contract expects as totals)
+function owedTotals(usr){
+  const chronicWei = parseUnits(String(Math.floor(usr.xp*CHRONIC_PER_XP)), TOKEN_DEC); // everyone earns CHRONIC
+  const monFloat   = usr.holds1M ? (usr.xp*MON_PER_XP) : 0;                              // MON only for 1M holders
+  const monWei     = parseEther(monFloat.toFixed(6));
+  return { chronicWei, monWei };
+}
+
+async function signClaim(userAddr, totalChronicWei, totalMonWei){
+  // inner = keccak256(abi.encodePacked(claimContract, chainId, user, totalChronic, totalMon))
+  const inner = solidityPackedKeccak256(
+    ['address','uint256','address','uint256','uint256'],
+    [CLAIM_CONTRACT, CHAIN_ID, userAddr, totalChronicWei, totalMonWei]
+  );
+  // sign the RAW 32 BYTES (not the hex string) — the contract verifies EIP-191 over these bytes
+  return await claimSigner.signMessage(getBytes(inner));
+}
+
+if (claimSigner && CLAIM_CONTRACT) {
+  http.createServer(async (req,res)=>{
+    res.setHeader('Access-Control-Allow-Origin','*');
+    res.setHeader('Content-Type','application/json');
+    try{
+      const url = new URL(req.url, 'http://x');
+      if (url.pathname !== '/claim') { res.writeHead(404); return res.end('{"error":"not found"}'); }
+      const wallet = (url.searchParams.get('wallet')||'').trim();
+      if (!isAddress(wallet)) { res.writeHead(400); return res.end('{"error":"bad wallet"}'); }
+
+      const usr = userByWallet(wallet);
+      if (!usr) { res.writeHead(200); return res.end(JSON.stringify({ found:false, message:'wallet not linked to any XP account — use /wallet in the group' })); }
+
+      await refreshHolds(usr); // refresh 1M-holder status for MON gating
+
+      const r = rankFor(usr.xp, RANKS);
+      const nx = nextRank(usr.xp, RANKS);
+      const { chronicWei, monWei } = owedTotals(usr);
+      const signature = await signClaim(wallet, chronicWei, monWei);
+
+      res.writeHead(200);
+      res.end(JSON.stringify({
+        found:true,
+        xp: usr.xp,
+        rankEmoji: r.emoji, rankName: r.name, nextAt: nx? nx.at : null,
+        holds1M: !!usr.holds1M,
+        totalChronic: chronicWei.toString(),
+        totalMon: monWei.toString(),
+        claimedChronic: '0', // contract tracks the real claimed amount; page shows owed-vs-onchain via contract reads if needed
+        claimedMon: '0',
+        signature
+      }));
+    }catch(e){ res.writeHead(500); res.end(JSON.stringify({error:String(e&&e.message||e)})); }
+  }).listen(API_PORT, ()=>console.log('claim API on :'+API_PORT+' (/claim?wallet=0x..)'));
+} else {
+  console.log('claim API disabled (set SIGNER_PRIVATE_KEY + CLAIM_CONTRACT to enable)');
+}
 
 bot.on('polling_error', e=>console.error('polling:',e.message));
 bot.getMe().then(m=>console.log(`XP bot [${PROJECT}] online as @${m.username} · payouts ${PAYOUTS_ENABLED?'ON':'OFF'}`));
