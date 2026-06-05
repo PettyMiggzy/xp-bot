@@ -111,7 +111,8 @@ async function refreshHolds(usr){
   usr._holds = usr._holds || {};
   for(const chatId in (usr.g||{})){
     const g=DB.groups[chatId]; if(!g || !g.mon) continue;
-    try{ const bal=await erc20(g.token).balanceOf(usr.wallet); usr._holds[chatId] = bal >= parseUnits(String(g.mon.holdReq), g.dec||18); }
+    const gate=g.mon.gate||g.token;            // MON gated by this token (defaults to the group's reward token)
+    try{ const bal=await erc20(gate).balanceOf(usr.wallet); usr._holds[chatId] = bal >= parseUnits(String(g.mon.holdReq), 18); }
     catch{ /* keep prior */ }
   }
   usr._chk=now;
@@ -151,8 +152,16 @@ bot.on('message', (msg)=>{
 });
 
 // ============ admin: set this group's reward token ============
-bot.onText(/^\/setreward(?:@\w+)?\s+(\S+)\s+(\S+)(?:\s+(\S+))?/i, async (msg,m)=>{
+bot.onText(/^\/setreward(?:@\w+)?\s+off\s*$/i, async (msg)=>{
   const reply=(t)=>bot.sendMessage(msg.chat.id,t,{reply_to_message_id:msg.message_id});
+  if(!(await isAdmin(msg))) return reply('admins only 🚫');
+  if(!DB.groups[msg.chat.id]) return reply('this group has no rewards set');
+  delete DB.groups[msg.chat.id]; save();
+  reply('🛑 rewards turned OFF for this group. (earned XP is kept; set a token again with /setreward)');
+});
+bot.onText(/^\/setreward(?:@\w+)?\s+(\S+)\s+(\S+)(?:\s+(\S+))?/i, async (msg,m)=>{
+  const reply=(t)=>bot.sendMessage(msg.chat.id,t,{parse_mode:'Markdown',reply_to_message_id:msg.message_id});
+  if(/^off$/i.test(m[1])) return; // handled above
   if(!(await isAdmin(msg))) return reply('admins only 🚫');
   const addr=m[1].trim();
   if(!isAddress(addr)) return reply('that token address isn\u2019t valid ser');
@@ -161,17 +170,29 @@ bot.onText(/^\/setreward(?:@\w+)?\s+(\S+)\s+(\S+)(?:\s+(\S+))?/i, async (msg,m)=
   const g = DB.groups[msg.chat.id] || {};
   g.token=addr; g.sym=sym; g.dec=g.dec||18; g.perXp=(perXp>0?perXp:1); if(g.mon===undefined)g.mon=null;
   DB.groups[msg.chat.id]=g; save();
-  reply(`✅ this group now rewards *${g.perXp} ${g.sym}* per XP\ntoken: ${shortA(addr)}\nMON bonus: ${g.mon?'on':'off — /setmon <hold> <monPerXp> to enable'}\n\nfund the pool with ${g.sym} and members earn by chatting (3+ words).`);
+  reply(`✅ this group now rewards *${g.perXp} ${g.sym}* per XP\ntoken: ${shortA(addr)}\nMON bonus: ${g.mon?'on':'off — /setmon <hold> <monPerXp> to enable'}\n\nfund the pool with ${g.sym} and members earn by chatting (${MIN_WORDS}+ words).`);
 });
-bot.onText(/^\/setmon(?:@\w+)?\s+(\S+)(?:\s+(\S+))?/i, async (msg,m)=>{
-  const reply=(t)=>bot.sendMessage(msg.chat.id,t,{reply_to_message_id:msg.message_id});
+bot.onText(/^\/setmon(?:@\w+)?\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?/i, async (msg,m)=>{
+  const reply=(t)=>bot.sendMessage(msg.chat.id,t,{parse_mode:'Markdown',reply_to_message_id:msg.message_id});
   if(!(await isAdmin(msg))) return reply('admins only 🚫');
   const g=DB.groups[msg.chat.id]; if(!g) return reply('set the reward token first: /setreward <token> <SYM>');
   if(/^off$/i.test(m[1])){ g.mon=null; save(); return reply('MON bonus turned off for this group'); }
   const holdReq=m[1].replace(/[, ]/g,''); const monPerXp=m[2]? Number(m[2]) : MON_PER_XP;
-  if(!(Number(holdReq)>0) || !(monPerXp>0)) return reply('usage: /setmon <holdAmount> <monPerXp>   (or /setmon off)');
-  g.mon={ holdReq, perXp: monPerXp }; save();
-  reply(`✅ MON bonus on: hold *${Number(holdReq).toLocaleString()} ${g.sym}* to also earn *${monPerXp} MON* per XP`);
+  if(!(Number(holdReq)>0) || !(monPerXp>0)) return reply('usage: /setmon <holdAmount> <monPerXp> [gateToken]   (or /setmon off)');
+  let gate=null;
+  if(m[3]){ if(!isAddress(m[3])) return reply('that gate-token address isn\u2019t valid'); gate=m[3].trim(); }
+  g.mon={ holdReq, perXp: monPerXp, gate }; save();
+  const gateLabel = gate? shortA(gate)+' (custom)' : g.sym;
+  reply(`✅ MON bonus on: hold *${Number(holdReq).toLocaleString()} ${gateLabel}* to also earn *${monPerXp} MON* per XP`);
+});
+// ============ show this group's setup ============
+bot.onText(/^\/config(?:@\w+)?$/i, (msg)=>{
+  const g=DB.groups[msg.chat.id];
+  if(!g) return bot.sendMessage(msg.chat.id,'this group isn\u2019t set up — an admin runs /setreward <token> <SYM> [perXp]',{reply_to_message_id:msg.message_id});
+  let s=`*Group rewards*\ntoken: *${g.sym}* (${shortA(g.token)})\nrate: *${g.perXp}* ${g.sym} / XP\n`;
+  if(g.mon){ const gate=g.mon.gate? shortA(g.mon.gate)+' (custom)' : g.sym; s+=`MON bonus: *on* — hold *${Number(g.mon.holdReq).toLocaleString()} ${gate}* → *${g.mon.perXp} MON* / XP`; }
+  else s+=`MON bonus: *off*`;
+  bot.sendMessage(msg.chat.id, s, {parse_mode:'Markdown', reply_to_message_id:msg.message_id});
 });
 
 // ============ member commands ============
@@ -220,7 +241,7 @@ bot.onText(/^\/help(?:@\w+)?$/i, (msg)=>{
   const g=DB.groups[msg.chat.id];
   const head = g ? `chat (${MIN_WORDS}+ words) to earn ${g.perXp} ${g.sym} per XP${g.mon?`. hold ${Number(g.mon.holdReq).toLocaleString()} ${g.sym} to also earn MON.`:'.'}`
                  : `this group isn\u2019t set up yet.`;
-  const admin = `\n\n*admin:* /setreward <token> <SYM> [perXp] · /setmon <hold> <monPerXp> | off`;
+  const admin = `\n\n*admin:* /setreward <token> <SYM> [perXp] · /setreward off · /setmon <hold> <monPerXp> [gateToken] | off · /config`;
   bot.sendMessage(msg.chat.id,
 `*XP REWARDS*\n${head}\n\n/rank — your XP, rank & claimable\n/bag — leaderboard\n/wallet 0x… — link your wallet\n/claim — claim on the site${admin}`,
   {parse_mode:'Markdown'});
