@@ -39,6 +39,8 @@ const XP_COOLDOWN_MS = Number(process.env.XP_COOLDOWN_SEC || '60') * 1000;
 const PAYOUTS_ENABLED = String(process.env.PAYOUTS_ENABLED || 'false').toLowerCase() === 'true';
 const CLAIM_URL = process.env.CLAIM_URL || 'https://burnchronic.xyz/claim';
 const SIGNER_PK = process.env.SIGNER_PRIVATE_KEY || '';
+const OWNER_ID  = String(process.env.OWNER_ID || '');   // your Telegram user id — only you can authorize groups
+const AUTHORIZED_CHATS = (process.env.AUTHORIZED_CHATS || '').split(',').map(s=>s.trim()).filter(Boolean); // chat ids always authorized (your groups)
 const API_PORT  = Number(process.env.API_PORT || '8645');
 const CORS_ORIGIN = process.env.CORS_ORIGIN || '*';
 const RL_MAX    = Number(process.env.RATE_LIMIT_PER_MIN || '60');
@@ -68,8 +70,8 @@ async function resolvePool(){
 
 // ============ PERSISTENCE ============
 const DB_FILE = './data.json';
-let DB = { users: {}, groups: {} };
-function load(){ try { DB = JSON.parse(fs.readFileSync(DB_FILE,'utf8')); } catch { /* fresh */ } if(!DB.users)DB.users={}; if(!DB.groups)DB.groups={}; }
+let DB = { users: {}, groups: {}, auth: {} };
+function load(){ try { DB = JSON.parse(fs.readFileSync(DB_FILE,'utf8')); } catch { /* fresh */ } if(!DB.users)DB.users={}; if(!DB.groups)DB.groups={}; if(!DB.auth)DB.auth={}; }
 let saveT=null;
 function save(){ clearTimeout(saveT); saveT=setTimeout(()=>{ try{ fs.writeFileSync(DB_FILE, JSON.stringify(DB)); }catch(e){console.error('save:',e.message);} }, 400); }
 function u(id){ if(!DB.users[id]) DB.users[id]={ wallet:'', name:'', g:{}, harvest:{} }; const x=DB.users[id]; if(!x.g)x.g={}; if(!x.harvest)x.harvest={}; return x; }
@@ -77,6 +79,9 @@ load();
 
 // ---- one-time migration: legacy flat .xp -> a "__legacy" CHRONIC group bucket ----
 function migrate(){
+  DB.auth = DB.auth || {};
+  DB.auth.__legacy = true;   // historical CHRONIC XP stays valid
+  for (const id of AUTHORIZED_CHATS) DB.auth[id] = true;   // your own groups, always on
   if (TOKEN_ADDR && !DB.groups.__legacy)
     DB.groups.__legacy = { token: TOKEN_ADDR, sym: TOKEN_SYM, dec: TOKEN_DEC, perXp: CHRONIC_PER_XP, mon: { holdReq: HOLD_REQ, perXp: MON_PER_XP } };
   for (const id in DB.users){
@@ -103,6 +108,7 @@ async function isAdmin(msg){
   try { const m=await bot.getChatMember(msg.chat.id, msg.from.id); return m && (m.status==='creator'||m.status==='administrator'); }
   catch { return false; }
 }
+function isOwner(msg){ return !!OWNER_ID && String(msg.from?.id)===OWNER_ID; }
 
 // refresh per-group holder status (for MON bonus gating); cached 30s on the user
 async function refreshHolds(usr){
@@ -110,7 +116,7 @@ async function refreshHolds(usr){
   const now=Date.now(); if(usr._chk && now-usr._chk < 30000) return;
   usr._holds = usr._holds || {};
   for(const chatId in (usr.g||{})){
-    const g=DB.groups[chatId]; if(!g || !g.mon) continue;
+    const g=DB.groups[chatId]; if(!g || !g.mon || !DB.auth[chatId]) continue;
     const gate=g.mon.gate||g.token;            // MON gated by this token (defaults to the group's reward token)
     try{ const bal=await erc20(gate).balanceOf(usr.wallet); usr._holds[chatId] = bal >= parseUnits(String(g.mon.holdReq), 18); }
     catch{ /* keep prior */ }
@@ -122,6 +128,7 @@ async function refreshHolds(usr){
 function owed(usr){
   const byToken={}; let monWei=0n;
   for(const chatId in (usr.g||{})){
+    if(!DB.auth[chatId]) continue;            // only authorized groups count toward claims
     const g=DB.groups[chatId]; if(!g) continue;
     const xp=usr.g[chatId].xp||0; if(xp<=0) continue;
     const tl=g.token.toLowerCase(), dec=g.dec||18;
@@ -141,7 +148,7 @@ bot.on('message', (msg)=>{
     if(!msg.from?.id || !msg.text || msg.text.startsWith('/')) return;
     if(msg.from?.is_bot && msg.from?.username !== 'GroupAnonymousBot') return;
     const grp = DB.groups[msg.chat.id];
-    if(!grp) return; // group not configured -> no XP (an admin must /setreward here)
+    if(!grp || !DB.auth[msg.chat.id]) return; // not configured/authorized -> no XP
     if(msg.text.trim().split(/\s+/).filter(Boolean).length < MIN_WORDS) return;
     const usr=u(msg.from.id);
     usr.name = (msg.from?.username==='GroupAnonymousBot') ? '👑 admin' : (msg.from.username? '@'+msg.from.username : (msg.from.first_name||'anon'));
@@ -149,6 +156,19 @@ bot.on('message', (msg)=>{
     const now=Date.now();
     if(now-(slot.lastXp||0) >= XP_COOLDOWN_MS){ slot.xp=(slot.xp||0)+XP_PER_MSG; slot.lastXp=now; save(); }
   }catch(e){ console.error('xp:',e.message); }
+});
+
+// ============ owner: authorize a group ============
+bot.onText(/^\/myid(?:@\w+)?$/i, (msg)=>{
+  bot.sendMessage(msg.chat.id, 'your telegram id: `'+msg.from.id+'`\nthis chat id: `'+msg.chat.id+'`', {parse_mode:'Markdown', reply_to_message_id:msg.message_id});
+});
+bot.onText(/^\/authorize(?:@\w+)?(?:\s+(\S+))?/i, (msg,m)=>{
+  const reply=(t)=>bot.sendMessage(msg.chat.id,t,{reply_to_message_id:msg.message_id});
+  if(!OWNER_ID) return reply('set OWNER_ID in the bot .env first (DM me /myid to get your id)');
+  if(!isOwner(msg)) return reply('owner only 🚫');
+  if(m[1] && /^off$/i.test(m[1])){ delete DB.auth[msg.chat.id]; save(); return reply('🛑 group de-authorized — its rewards are paused'); }
+  DB.auth[msg.chat.id]=true; save();
+  reply('✅ group authorized for the rewards pool. now set its token: /setreward <token> <SYM> [perXp]');
 });
 
 // ============ admin: set this group's reward token ============
@@ -163,6 +183,7 @@ bot.onText(/^\/setreward(?:@\w+)?\s+(\S+)\s+(\S+)(?:\s+(\S+))?/i, async (msg,m)=
   const reply=(t)=>bot.sendMessage(msg.chat.id,t,{parse_mode:'Markdown',reply_to_message_id:msg.message_id});
   if(/^off$/i.test(m[1])) return; // handled above
   if(!(await isAdmin(msg))) return reply('admins only 🚫');
+  if(!DB.auth[msg.chat.id]) return reply('this group isn\u2019t authorized yet — the owner runs /authorize first');
   const addr=m[1].trim();
   if(!isAddress(addr)) return reply('that token address isn\u2019t valid ser');
   const sym=m[2].toUpperCase().replace(/^\$/,'').slice(0,12);
@@ -175,6 +196,7 @@ bot.onText(/^\/setreward(?:@\w+)?\s+(\S+)\s+(\S+)(?:\s+(\S+))?/i, async (msg,m)=
 bot.onText(/^\/setmon(?:@\w+)?\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?/i, async (msg,m)=>{
   const reply=(t)=>bot.sendMessage(msg.chat.id,t,{parse_mode:'Markdown',reply_to_message_id:msg.message_id});
   if(!(await isAdmin(msg))) return reply('admins only 🚫');
+  if(!DB.auth[msg.chat.id]) return reply('this group isn\u2019t authorized yet — the owner runs /authorize first');
   const g=DB.groups[msg.chat.id]; if(!g) return reply('set the reward token first: /setreward <token> <SYM>');
   if(/^off$/i.test(m[1])){ g.mon=null; save(); return reply('MON bonus turned off for this group'); }
   const holdReq=m[1].replace(/[, ]/g,''); const monPerXp=m[2]? Number(m[2]) : MON_PER_XP;
@@ -192,6 +214,7 @@ bot.onText(/^\/config(?:@\w+)?$/i, (msg)=>{
   let s=`*Group rewards*\ntoken: *${g.sym}* (${shortA(g.token)})\nrate: *${g.perXp}* ${g.sym} / XP\n`;
   if(g.mon){ const gate=g.mon.gate? shortA(g.mon.gate)+' (custom)' : g.sym; s+=`MON bonus: *on* — hold *${Number(g.mon.holdReq).toLocaleString()} ${gate}* → *${g.mon.perXp} MON* / XP`; }
   else s+=`MON bonus: *off*`;
+  s+=`\nauthorized: *${DB.auth[msg.chat.id]?'yes':'NO — owner runs /authorize'}*`;
   bot.sendMessage(msg.chat.id, s, {parse_mode:'Markdown', reply_to_message_id:msg.message_id});
 });
 
@@ -241,7 +264,7 @@ bot.onText(/^\/help(?:@\w+)?$/i, (msg)=>{
   const g=DB.groups[msg.chat.id];
   const head = g ? `chat (${MIN_WORDS}+ words) to earn ${g.perXp} ${g.sym} per XP${g.mon?`. hold ${Number(g.mon.holdReq).toLocaleString()} ${g.sym} to also earn MON.`:'.'}`
                  : `this group isn\u2019t set up yet.`;
-  const admin = `\n\n*admin:* /setreward <token> <SYM> [perXp] · /setreward off · /setmon <hold> <monPerXp> [gateToken] | off · /config`;
+  const admin = `\n\n*admin:* /setreward <token> <SYM> [perXp] · /setreward off · /setmon <hold> <monPerXp> [gateToken] | off · /config\n*owner:* /authorize [off] · /myid`;
   bot.sendMessage(msg.chat.id,
 `*XP REWARDS*\n${head}\n\n/rank — your XP, rank & claimable\n/bag — leaderboard\n/wallet 0x… — link your wallet\n/claim — claim on the site${admin}`,
   {parse_mode:'Markdown'});
