@@ -174,7 +174,7 @@ bot.onText(/^\/authorize(?:@\w+)?(?:\s+(\S+))?/i, (msg,m)=>{
 // ============ admin: set this group's reward token ============
 bot.onText(/^\/setreward(?:@\w+)?\s+off\s*$/i, async (msg)=>{
   const reply=(t)=>bot.sendMessage(msg.chat.id,t,{reply_to_message_id:msg.message_id});
-  if(!(await isAdmin(msg))) return reply('admins only 🚫');
+  if(!isOwner(msg)) return reply('owner only 🚫 — only the owner sets rewards');
   if(!DB.groups[msg.chat.id]) return reply('this group has no rewards set');
   delete DB.groups[msg.chat.id]; save();
   reply('🛑 rewards turned OFF for this group. (earned XP is kept; set a token again with /setreward)');
@@ -182,7 +182,7 @@ bot.onText(/^\/setreward(?:@\w+)?\s+off\s*$/i, async (msg)=>{
 bot.onText(/^\/setreward(?:@\w+)?\s+(\S+)\s+(\S+)(?:\s+(\S+))?/i, async (msg,m)=>{
   const reply=(t)=>bot.sendMessage(msg.chat.id,t,{parse_mode:'Markdown',reply_to_message_id:msg.message_id});
   if(/^off$/i.test(m[1])) return; // handled above
-  if(!(await isAdmin(msg))) return reply('admins only 🚫');
+  if(!isOwner(msg)) return reply('owner only 🚫 — only the owner sets rewards');
   if(!DB.auth[msg.chat.id]) return reply('this group isn\u2019t authorized yet — the owner runs /authorize first');
   const addr=m[1].trim();
   if(!isAddress(addr)) return reply('that token address isn\u2019t valid ser');
@@ -195,7 +195,7 @@ bot.onText(/^\/setreward(?:@\w+)?\s+(\S+)\s+(\S+)(?:\s+(\S+))?/i, async (msg,m)=
 });
 bot.onText(/^\/setmon(?:@\w+)?\s+(\S+)(?:\s+(\S+))?(?:\s+(\S+))?/i, async (msg,m)=>{
   const reply=(t)=>bot.sendMessage(msg.chat.id,t,{parse_mode:'Markdown',reply_to_message_id:msg.message_id});
-  if(!(await isAdmin(msg))) return reply('admins only 🚫');
+  if(!isOwner(msg)) return reply('owner only 🚫 — only the owner sets rewards');
   if(!DB.auth[msg.chat.id]) return reply('this group isn\u2019t authorized yet — the owner runs /authorize first');
   const g=DB.groups[msg.chat.id]; if(!g) return reply('set the reward token first: /setreward <token> <SYM>');
   if(/^off$/i.test(m[1])){ g.mon=null; save(); return reply('MON bonus turned off for this group'); }
